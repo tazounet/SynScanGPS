@@ -4,7 +4,7 @@
         {
             "label": "Force reboot into BOOTSEL",
             "type": "process",
-            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
+            "command": "${env:HOME}/.pico-sdk/picotool/2.2.0/picotool/picotool",
             "args": [
                 "reboot",
                 "-f",
@@ -16,7 +16,7 @@
             },
             "problemMatcher": [],
             "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
+                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.2.0/picotool/picotool.exe"
             }
         },
         {
@@ -41,7 +41,7 @@
         {
             "label": "Run Project",
             "type": "process",
-            "command": "${env:HOME}/.pico-sdk/picotool/2.1.1/picotool/picotool",
+            "command": "${env:HOME}/.pico-sdk/picotool/2.2.0/picotool/picotool",
             "args": [
                 "load",
                 "${command:raspberry-pi-pico.launchTargetPath}",
@@ -53,7 +53,7 @@
             },
             "problemMatcher": [],
             "windows": {
-                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.1.1/picotool/picotool.exe"
+                "command": "${env:USERPROFILE}/.pico-sdk/picotool/2.2.0/picotool/picotool.exe"
             }
         },
         {

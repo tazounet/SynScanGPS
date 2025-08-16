@@ -4,10 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/status_led.h"
 #include "minmea.h"
-#include "hardware/pio.h"
-#include "hardware/clocks.h"
-#include "ws2812.pio.h"
 
 // GPS uart configuration
 #define GPS_UART_ID uart0
@@ -21,13 +19,14 @@
 #define SYNSCAN_UART_TX_PIN 8
 #define SYNSCAN_UART_RX_PIN 9
 
-// WS2812 configuration
-#define WS2812_PIO_ID pio0
-#define WS2812_PIN 16
+// LED colors
+#define RED_LED PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0x0f, 0, 0)
+#define YELLOW_LED PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0x0f, 0x50, 0)
+#define GREEN_LED PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0, 0x0f, 0)
 
 // SynScan binary message
 // User Position, Velocity & Time II (D1h)
-typedef struct pvt_msg_t
+typedef struct synscan_pvt_msg_t
 {
     uint16_t week_no;
     uint32_t time_of_week;
@@ -47,18 +46,22 @@ typedef struct pvt_msg_t
     uint8_t hdop;
     uint8_t vdop;
     uint8_t tdop;
-} __attribute__((packed)) pvt_msg_t;
+} __attribute__((packed)) synscan_pvt_msg_t;
+// header = 4 bytes
+// crc + trailer = 3 bytes
+#define SYNSCAN_PVT_MSG_SIZE (4 + sizeof(synscan_pvt_msg_t) + 3)
 
 static void synscan_parse(char c);
-static void synscan_send_pvt_msg(pvt_msg_t *pvt);
-static void synscan_send_msg(char *msg, uint16_t len);
+static void synscan_build_pvt_msg(synscan_pvt_msg_t *pvt, char *msg);
+static void sendAck();
 static uint8_t uint2bcd(int val);
 static char compute_checksum(char *buf, uint16_t len);
 static void gps_parse(char c);
 
 // Global State
-bool g_send_pvt_msg = false;
-pvt_msg_t g_pvt_msg = {0};
+bool g_send_synscan_pvt_msg = false;
+synscan_pvt_msg_t g_synscan_pvt_msg = {0};
+bool g_new_nmea = false;
 
 // Synscan command buffer
 #define SYNSCAN_BUFF_SIZE 32
@@ -70,15 +73,12 @@ uint8_t g_synscan_index = 0;
 char g_nmea_buffer[GPS_BUFF_SIZE] = {0};
 uint8_t g_nmea_index = 0;
 
-void put_pixel(uint32_t pixel_grb)
+bool colored_status_led_change_color(uint32_t color)
 {
-    pio_sm_put_blocking(WS2812_PIO_ID, 0, pixel_grb << 8u);
-}
-
-void put_rgb(uint8_t red, uint8_t green, uint8_t blue)
-{
-    uint32_t mask = (green << 16) | (red << 8) | (blue << 0);
-    put_pixel(mask);
+    // we need to turn off the LED first to change color
+    colored_status_led_set_state(false);
+    sleep_us(100);
+    return colored_status_led_set_on_with_color(color);
 }
 
 uint8_t uint2bcd(int val)
@@ -119,24 +119,22 @@ static void synscan_parse(char c)
         if (strncmp(g_synscan_buffer, "%%\xf1\x13\x00\xe2\r\n", g_synscan_index) == 0)
         {
             // No output
-            g_send_pvt_msg = false;
+            g_send_synscan_pvt_msg = false;
 
             printf("Received 'no output' command\n");
 
             // Send ack
-            char msg[7] = {'%', '%', '\x06', '\x13', '\x15', '\r', '\n'};
-            synscan_send_msg(msg, 7);
+            sendAck();
         }
         else if (strncmp(g_synscan_buffer, "%%\xf1\x13\x03\xe1\r\n", g_synscan_index) == 0)
         {
             // Binary PVT output
-            g_send_pvt_msg = true;
+            g_send_synscan_pvt_msg = true;
 
             printf("Received 'binary output' command\n");
 
             // Send ack
-            char msg[7] = {'%', '%', '\x06', '\x13', '\x15', '\r', '\n'};
-            synscan_send_msg(msg, 7);
+            sendAck();
         }
         else
         {
@@ -153,34 +151,31 @@ static void synscan_parse(char c)
     }
 }
 
-static void synscan_send_pvt_msg(pvt_msg_t *pvt)
+static void synscan_build_pvt_msg(synscan_pvt_msg_t *pvt, char *msg)
 {
-    uint16_t size = 4 + sizeof(pvt_msg_t);
-    char msg[size];
+    uint16_t size_for_crc = 4 + sizeof(synscan_pvt_msg_t);
 
+    // header
     msg[0] = '%';
     msg[1] = '%';
     msg[2] = '\xf2';
     msg[3] = '\xd1';
 
-    memcpy(msg + 4, pvt, sizeof(pvt_msg_t));
-
-    for (uint16_t i = 0; i < size; i++)
-    {
-        uart_putc_raw(SYNSCAN_UART_ID, msg[i]);
-    }
+    // copy PVT data
+    memcpy(msg + 4, pvt, sizeof(synscan_pvt_msg_t));
 
     // Checksum
-    uart_putc_raw(SYNSCAN_UART_ID, compute_checksum(msg, size));
+    msg[size_for_crc] = compute_checksum(msg, size_for_crc);
 
-    // End
-    uart_putc_raw(SYNSCAN_UART_ID, '\r');
-    uart_putc_raw(SYNSCAN_UART_ID, '\n');
+    // Trailer
+    msg[size_for_crc + 1] = '\r';
+    msg[size_for_crc + 2] = '\n';
 }
 
-static void synscan_send_msg(char *msg, uint16_t len)
+static void sendAck()
 {
-    for (uint16_t i = 0; i < len; i++)
+    char msg[7] = {'%', '%', '\x06', '\x13', '\x15', '\r', '\n'};
+    for (uint16_t i = 0; i < sizeof(msg); i++)
     {
         uart_putc_raw(SYNSCAN_UART_ID, msg[i]);
     }
@@ -206,34 +201,33 @@ static void gps_parse(char c)
             {
                 uint8_t tmp_bytes[4];
 
-                g_pvt_msg.week_no = 0; // not used
-                g_pvt_msg.time_of_week = 0; // not used
+                g_synscan_pvt_msg.week_no = 0;      // not used
+                g_synscan_pvt_msg.time_of_week = 0; // not used
 
                 tmp_bytes[0] = uint2bcd(frame.date.day);
                 tmp_bytes[1] = uint2bcd(frame.date.month);
                 tmp_bytes[2] = uint2bcd(frame.date.year);
                 tmp_bytes[3] = 0;
-                memcpy(&(g_pvt_msg.date), tmp_bytes, 4);
+                memcpy(&(g_synscan_pvt_msg.date), tmp_bytes, 4);
 
                 tmp_bytes[0] = uint2bcd(frame.time.seconds);
                 tmp_bytes[1] = uint2bcd(frame.time.minutes);
                 tmp_bytes[2] = uint2bcd(frame.time.hours);
                 tmp_bytes[3] = 0;
-                memcpy(&(g_pvt_msg.time), tmp_bytes, sizeof(g_pvt_msg.time));
+                memcpy(&(g_synscan_pvt_msg.time), tmp_bytes, sizeof(g_synscan_pvt_msg.time));
 
                 float latitude = (minmea_tocoord(&frame.latitude) / 360.0) * 4294967296.0;
-                g_pvt_msg.latitude = (int32_t) latitude;
+                g_synscan_pvt_msg.latitude = (int32_t)latitude;
 
                 float longitude = (minmea_tocoord(&frame.longitude) / 360.0) * 4294967296.0;
-                g_pvt_msg.longitude = (int32_t) longitude;
+                g_synscan_pvt_msg.longitude = (int32_t)longitude;
 
-                g_pvt_msg.heading = (uint16_t)minmea_tofloat(&frame.course);
-                g_pvt_msg.speed = (uint16_t)minmea_tofloat(&frame.speed);
+                g_synscan_pvt_msg.heading = (uint16_t)minmea_tofloat(&frame.course);
+                g_synscan_pvt_msg.speed = (uint16_t)minmea_tofloat(&frame.speed);
 
-                if (g_send_pvt_msg)
-                {
-                    synscan_send_pvt_msg(&g_pvt_msg);
-                }
+                // Flag that we have a new NMEA sentence using the RMC sentence
+                // shall be only set once per second
+                g_new_nmea = true;
             }
             else
             {
@@ -247,10 +241,10 @@ static void gps_parse(char c)
             struct minmea_sentence_gga frame;
             if (minmea_parse_gga(&frame, g_nmea_buffer))
             {
-                g_pvt_msg.altitude = (int16_t)minmea_tofloat(&frame.altitude);
-                g_pvt_msg.number_of_sv = frame.satellites_tracked;
-                g_pvt_msg.number_of_sv_in_fix = frame.satellites_tracked;
-                g_pvt_msg.fix_indicator = 0; // not used
+                g_synscan_pvt_msg.altitude = (int16_t)minmea_tofloat(&frame.altitude);
+                g_synscan_pvt_msg.number_of_sv = frame.satellites_tracked;
+                g_synscan_pvt_msg.number_of_sv_in_fix = frame.satellites_tracked;
+                g_synscan_pvt_msg.fix_indicator = 0; // not used
             }
             else
             {
@@ -265,26 +259,10 @@ static void gps_parse(char c)
             struct minmea_sentence_gsa frame;
             if (minmea_parse_gsa(&frame, g_nmea_buffer))
             {
-                g_pvt_msg.pdop = (uint8_t)minmea_tofloat(&frame.pdop) * 10;
-                g_pvt_msg.hdop = (uint8_t)minmea_tofloat(&frame.hdop) * 10;
-                g_pvt_msg.vdop = (uint8_t)minmea_tofloat(&frame.vdop) * 10;
-                g_pvt_msg.quality_of_fix = frame.fix_type - 1; // 0 for no fix, 1 for 2D fix, 2 for 3D fix
-
-                if (frame.fix_type == MINMEA_GPGSA_FIX_NONE)
-                {
-                    // red LED
-                    put_rgb(0x50, 0, 0);
-                }
-                else if (frame.fix_type == MINMEA_GPGSA_FIX_2D)
-                {
-                    // yellow LED
-                    put_rgb(0x50, 0x50, 0);
-                }
-                else if (frame.fix_type == MINMEA_GPGSA_FIX_3D)
-                {
-                    // green LED
-                    put_rgb(0, 0x50, 0);
-                }
+                g_synscan_pvt_msg.pdop = (uint8_t)(minmea_tofloat(&frame.pdop) * 10.0);
+                g_synscan_pvt_msg.hdop = (uint8_t)(minmea_tofloat(&frame.hdop) * 10.0);
+                g_synscan_pvt_msg.vdop = (uint8_t)(minmea_tofloat(&frame.vdop) * 10.0);
+                g_synscan_pvt_msg.quality_of_fix = frame.fix_type - 1; // 0 for no fix, 1 for 2D fix, 2 for 3D fix
             }
             else
             {
@@ -306,7 +284,7 @@ static void gps_parse(char c)
         break;
 
         default: // ignore other sentences
-        break;
+            break;
         }
 
         g_nmea_index = 0;
@@ -315,6 +293,9 @@ static void gps_parse(char c)
 
 int main()
 {
+    char synscan_pvt_buff[SYNSCAN_PVT_MSG_SIZE] = {0};
+    uint16_t synscan_pvt_buff_index = SYNSCAN_PVT_MSG_SIZE;
+
     stdio_init_all();
 
     // GPS UART initialization
@@ -327,27 +308,67 @@ int main()
     gpio_set_function(SYNSCAN_UART_RX_PIN, UART_FUNCSEL_NUM(SYNSCAN_UART_ID, SYNSCAN_UART_RX_PIN));
     uart_init(SYNSCAN_UART_ID, SYNSCAN_BAUD_RATE);
 
-    // WS2812 PIO initialization
-    uint offset = pio_add_program(WS2812_PIO_ID, &ws2812_program);
-    ws2812_program_init(WS2812_PIO_ID, 0, offset, WS2812_PIN, 800000, true);
+    // LED initialization
+    status_led_init();
 
     // red LED
-    put_rgb(0x50, 0, 0);
+    colored_status_led_set_on_with_color(RED_LED);
 
     while (true)
     {
         // GPS UART processing
-        if (uart_is_readable(GPS_UART_ID))
+        while (uart_is_readable(GPS_UART_ID))
         {
             char c = uart_getc(GPS_UART_ID);
             gps_parse(c);
         }
 
         // SynScan UART processing
-        if (uart_is_readable(SYNSCAN_UART_ID))
+        while (uart_is_readable(SYNSCAN_UART_ID))
         {
             char c = uart_getc(SYNSCAN_UART_ID);
             synscan_parse(c);
+        }
+
+        // send SynScan PVT message char by char to avoid blocking the loop too long
+        if (synscan_pvt_buff_index < SYNSCAN_PVT_MSG_SIZE)
+        {
+            // Send the next bytes of the PVT message
+            for (uint16_t i = 0; (i < 4) && (synscan_pvt_buff_index < SYNSCAN_PVT_MSG_SIZE); i++)
+            {
+                uart_putc_raw(SYNSCAN_UART_ID, synscan_pvt_buff[synscan_pvt_buff_index++]);
+            }
+        }
+
+        // check if we have a new NMEA sentence
+        if (g_new_nmea)
+        {
+            // Update the status LED color
+            if (g_synscan_pvt_msg.quality_of_fix == 0) // No fix
+            {
+                colored_status_led_change_color(RED_LED);
+            }
+            else if (g_synscan_pvt_msg.quality_of_fix == 1) // 2D fix
+            {
+                colored_status_led_change_color(YELLOW_LED);
+            }
+            else if (g_synscan_pvt_msg.quality_of_fix == 2) // 3D fix
+            {
+                colored_status_led_change_color(GREEN_LED);
+            }
+
+            // Check if we need to send the SynScan PVT message
+            if (g_send_synscan_pvt_msg)
+            {
+                // Build the PVT message
+                synscan_build_pvt_msg(&g_synscan_pvt_msg, synscan_pvt_buff);
+
+                // Reset the index to start sending the message
+                synscan_pvt_buff_index = 0;
+            }
+
+            // Reset the new NMEA flag
+            g_new_nmea = false;
         }
     }
 

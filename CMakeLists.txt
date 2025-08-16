@@ -15,9 +15,9 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.1.1)
+set(sdkVersion 2.2.0)
 set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.1.1)
+set(picotoolVersion 2.2.0)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -43,19 +43,14 @@ if (TARGET tinyusb_device)
             minmea.c
             )
 
-    pico_generate_pio_header(synscan_gps ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR}/generated)
-
     # pull in common dependencies
-    target_link_libraries(synscan_gps pico_stdlib)
+    target_link_libraries(synscan_gps
+            pico_stdlib
+            pico_status_led)
 
     # enable usb output, disable uart output
     pico_enable_stdio_usb(synscan_gps 1)
     pico_enable_stdio_uart(synscan_gps 0)
-
-    # Add any user requested libraries
-    target_link_libraries(synscan_gps
-            hardware_pio
-            )
 
     # create map/bin/hex/uf2 file etc.
     pico_add_extra_outputs(synscan_gps)
