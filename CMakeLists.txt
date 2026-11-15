@@ -15,9 +15,9 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.2.0)
+set(sdkVersion 2.3.1)
 set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.2.0)
+set(picotoolVersion 2.3.1)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -46,6 +46,7 @@ if (TARGET tinyusb_device)
     # pull in common dependencies
     target_link_libraries(synscan_gps
             pico_stdlib
+            pico_multicore
             pico_status_led)
 
     # enable usb output, disable uart output

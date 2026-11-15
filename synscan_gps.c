@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "pico/status_led.h"
+#include "pico/critical_section.h"
 #include "minmea.h"
 
 // GPS uart configuration
@@ -23,6 +25,10 @@
 #define RED_LED PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0x0f, 0, 0)
 #define YELLOW_LED PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0x0f, 0x50, 0)
 #define GREEN_LED PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0, 0x0f, 0)
+
+// Constants
+#define GPS_BUFF_SIZE MINMEA_MAX_SENTENCE_LENGTH
+#define SYNSCAN_BUFF_SIZE 32
 
 // SynScan binary message
 // User Position, Velocity & Time II (D1h)
@@ -57,27 +63,33 @@ static void sendAck();
 static uint8_t uint2bcd(int val);
 static char compute_checksum(char *buf, uint16_t len);
 static void gps_parse(char c);
+static void gps_core1_entry(void);
 
 // Global State
-bool g_send_synscan_pvt_msg = false;
-synscan_pvt_msg_t g_synscan_pvt_msg = {0};
-bool g_new_nmea = false;
+bool g_send_synscan_binary_pvt_msg = false;
+bool g_send_synscan_gga_pvt_msg = false;
+bool g_new_gps_nmea = false;
+bool g_new_synscan_gga_pvt_msg = false;
+critical_section_t g_gps_critical_section;
 
 // Synscan command buffer
-#define SYNSCAN_BUFF_SIZE 32
 char g_synscan_buffer[SYNSCAN_BUFF_SIZE] = {0};
 uint8_t g_synscan_index = 0;
 
 // GPS nmea buffer
-#define GPS_BUFF_SIZE MINMEA_MAX_SENTENCE_LENGTH
 char g_nmea_buffer[GPS_BUFF_SIZE] = {0};
 uint8_t g_nmea_index = 0;
+
+// Output buffers
+synscan_pvt_msg_t g_synscan_binary_pvt_msg = {0};
+char g_synscan_gga_pvt_msg[GPS_BUFF_SIZE] = {0};
 
 bool colored_status_led_change_color(uint32_t color)
 {
     // we need to turn off the LED first to change color
+    /* (not needed with the Pico SDK 2.3.1)
     colored_status_led_set_state(false);
-    sleep_us(100);
+    sleep_us(100); */
     return colored_status_led_set_on_with_color(color);
 }
 
@@ -102,6 +114,12 @@ static char compute_checksum(char *buf, uint16_t len)
 
 static void synscan_parse(char c)
 {
+    // Valid commands start with '%%'
+    if (g_synscan_index == 0 && c != '%')
+    {
+        return;
+    }
+
     // Add byte to buffer
     if (g_synscan_index < SYNSCAN_BUFF_SIZE - 1)
     {
@@ -119,7 +137,8 @@ static void synscan_parse(char c)
         if (strncmp(g_synscan_buffer, "%%\xf1\x13\x00\xe2\r\n", g_synscan_index) == 0)
         {
             // No output
-            g_send_synscan_pvt_msg = false;
+            g_send_synscan_binary_pvt_msg = false;
+            g_send_synscan_gga_pvt_msg = false;
 
             printf("Received 'no output' command\n");
 
@@ -129,9 +148,21 @@ static void synscan_parse(char c)
         else if (strncmp(g_synscan_buffer, "%%\xf1\x13\x03\xe1\r\n", g_synscan_index) == 0)
         {
             // Binary PVT output
-            g_send_synscan_pvt_msg = true;
+            g_send_synscan_binary_pvt_msg = true;
+            g_send_synscan_gga_pvt_msg = false;
 
             printf("Received 'binary output' command\n");
+
+            // Send ack
+            sendAck();
+        }
+        else if (strncmp(g_synscan_buffer, "%%\xf1\x13\x01\xe3\r\n", g_synscan_index) == 0)
+        {
+            // GGA PVT output
+            g_send_synscan_binary_pvt_msg = false;
+            g_send_synscan_gga_pvt_msg = true;
+
+            printf("Received 'GGA output' command\n");
 
             // Send ack
             sendAck();
@@ -199,35 +230,41 @@ static void gps_parse(char c)
             struct minmea_sentence_rmc frame;
             if (minmea_parse_rmc(&frame, g_nmea_buffer))
             {
-                uint8_t tmp_bytes[4];
-
-                g_synscan_pvt_msg.week_no = 0;      // not used
-                g_synscan_pvt_msg.time_of_week = 0; // not used
-
-                tmp_bytes[0] = uint2bcd(frame.date.day);
-                tmp_bytes[1] = uint2bcd(frame.date.month);
-                tmp_bytes[2] = uint2bcd(frame.date.year);
-                tmp_bytes[3] = 0;
-                memcpy(&(g_synscan_pvt_msg.date), tmp_bytes, 4);
-
-                tmp_bytes[0] = uint2bcd(frame.time.seconds);
-                tmp_bytes[1] = uint2bcd(frame.time.minutes);
-                tmp_bytes[2] = uint2bcd(frame.time.hours);
-                tmp_bytes[3] = 0;
-                memcpy(&(g_synscan_pvt_msg.time), tmp_bytes, sizeof(g_synscan_pvt_msg.time));
+                uint8_t date_bytes[4] = {
+                    uint2bcd(frame.date.day),
+                    uint2bcd(frame.date.month),
+                    uint2bcd(frame.date.year),
+                    0};
+                uint8_t time_bytes[4] = {
+                    uint2bcd(frame.time.seconds),
+                    uint2bcd(frame.time.minutes),
+                    uint2bcd(frame.time.hours),
+                    0};
+                uint32_t date;
+                uint32_t time;
+                memcpy(&date, date_bytes, sizeof(date));
+                memcpy(&time, time_bytes, sizeof(time));
 
                 float latitude = (minmea_tocoord(&frame.latitude) / 360.0) * 4294967296.0;
-                g_synscan_pvt_msg.latitude = (int32_t)latitude;
-
                 float longitude = (minmea_tocoord(&frame.longitude) / 360.0) * 4294967296.0;
-                g_synscan_pvt_msg.longitude = (int32_t)longitude;
-
-                g_synscan_pvt_msg.heading = (uint16_t)minmea_tofloat(&frame.course);
-                g_synscan_pvt_msg.speed = (uint16_t)minmea_tofloat(&frame.speed);
+                int32_t latitude_value = (int32_t)latitude;
+                int32_t longitude_value = (int32_t)longitude;
+                uint16_t heading = (uint16_t)minmea_tofloat(&frame.course);
+                uint16_t speed = (uint16_t)minmea_tofloat(&frame.speed);
 
                 // Flag that we have a new NMEA sentence using the RMC sentence
                 // shall be only set once per second
-                g_new_nmea = true;
+                critical_section_enter_blocking(&g_gps_critical_section);
+                g_synscan_binary_pvt_msg.week_no = 0;      // not used
+                g_synscan_binary_pvt_msg.time_of_week = 0; // not used
+                g_synscan_binary_pvt_msg.date = date;
+                g_synscan_binary_pvt_msg.time = time;
+                g_synscan_binary_pvt_msg.latitude = latitude_value;
+                g_synscan_binary_pvt_msg.longitude = longitude_value;
+                g_synscan_binary_pvt_msg.heading = heading;
+                g_synscan_binary_pvt_msg.speed = speed;
+                g_new_gps_nmea = true;
+                critical_section_exit(&g_gps_critical_section);
             }
             else
             {
@@ -241,10 +278,15 @@ static void gps_parse(char c)
             struct minmea_sentence_gga frame;
             if (minmea_parse_gga(&frame, g_nmea_buffer))
             {
-                g_synscan_pvt_msg.altitude = (int16_t)minmea_tofloat(&frame.altitude);
-                g_synscan_pvt_msg.number_of_sv = frame.satellites_tracked;
-                g_synscan_pvt_msg.number_of_sv_in_fix = frame.satellites_tracked;
-                g_synscan_pvt_msg.fix_indicator = 0; // not used
+                int16_t altitude = (int16_t)minmea_tofloat(&frame.altitude);
+                critical_section_enter_blocking(&g_gps_critical_section);
+                g_synscan_binary_pvt_msg.altitude = altitude;
+                g_synscan_binary_pvt_msg.number_of_sv = frame.satellites_tracked;
+                g_synscan_binary_pvt_msg.number_of_sv_in_fix = frame.satellites_tracked;
+                g_synscan_binary_pvt_msg.fix_indicator = 0; // not used
+                memcpy(g_synscan_gga_pvt_msg, g_nmea_buffer, g_nmea_index + 1);
+                g_new_synscan_gga_pvt_msg = true;
+                critical_section_exit(&g_gps_critical_section);
             }
             else
             {
@@ -259,10 +301,16 @@ static void gps_parse(char c)
             struct minmea_sentence_gsa frame;
             if (minmea_parse_gsa(&frame, g_nmea_buffer))
             {
-                g_synscan_pvt_msg.pdop = (uint8_t)(minmea_tofloat(&frame.pdop) * 10.0);
-                g_synscan_pvt_msg.hdop = (uint8_t)(minmea_tofloat(&frame.hdop) * 10.0);
-                g_synscan_pvt_msg.vdop = (uint8_t)(minmea_tofloat(&frame.vdop) * 10.0);
-                g_synscan_pvt_msg.quality_of_fix = frame.fix_type - 1; // 0 for no fix, 1 for 2D fix, 2 for 3D fix
+                uint8_t pdop = (uint8_t)(minmea_tofloat(&frame.pdop) * 10.0);
+                uint8_t hdop = (uint8_t)(minmea_tofloat(&frame.hdop) * 10.0);
+                uint8_t vdop = (uint8_t)(minmea_tofloat(&frame.vdop) * 10.0);
+                uint8_t quality_of_fix = frame.fix_type - 1; // 0 for no fix, 1 for 2D fix, 2 for 3D fix
+                critical_section_enter_blocking(&g_gps_critical_section);
+                g_synscan_binary_pvt_msg.pdop = pdop;
+                g_synscan_binary_pvt_msg.hdop = hdop;
+                g_synscan_binary_pvt_msg.vdop = vdop;
+                g_synscan_binary_pvt_msg.quality_of_fix = quality_of_fix;
+                critical_section_exit(&g_gps_critical_section);
             }
             else
             {
@@ -291,22 +339,41 @@ static void gps_parse(char c)
     }
 }
 
-int main()
+static void gps_core1_entry(void)
 {
-    char synscan_pvt_buff[SYNSCAN_PVT_MSG_SIZE] = {0};
-    uint16_t synscan_pvt_buff_index = SYNSCAN_PVT_MSG_SIZE;
-
-    stdio_init_all();
-
     // GPS UART initialization
     gpio_set_function(GPS_UART_TX_PIN, UART_FUNCSEL_NUM(GPS_UART_ID, GPS_UART_TX_PIN));
     gpio_set_function(GPS_UART_RX_PIN, UART_FUNCSEL_NUM(GPS_UART_ID, GPS_UART_RX_PIN));
     uart_init(GPS_UART_ID, GPS_BAUD_RATE);
 
+    while (true)
+    {
+        while (uart_is_readable(GPS_UART_ID))
+        {
+            gps_parse(uart_getc(GPS_UART_ID));
+        }
+        tight_loop_contents();
+    }
+}
+
+int main()
+{
+    char synscan_pvt_buff[SYNSCAN_PVT_MSG_SIZE] = {0};
+    uint16_t synscan_pvt_buff_index = SYNSCAN_PVT_MSG_SIZE;
+    synscan_pvt_msg_t synscan_pvt_msg = {0};
+    char synscan_gga_pvt_buff[GPS_BUFF_SIZE] = {0};
+    uint16_t synscan_gga_pvt_buff_index = GPS_BUFF_SIZE;
+    uint16_t synscan_gga_pvt_buff_length = 0;
+
+    stdio_init_all();
+
     // SynScan UART initialization
     gpio_set_function(SYNSCAN_UART_TX_PIN, UART_FUNCSEL_NUM(SYNSCAN_UART_ID, SYNSCAN_UART_TX_PIN));
     gpio_set_function(SYNSCAN_UART_RX_PIN, UART_FUNCSEL_NUM(SYNSCAN_UART_ID, SYNSCAN_UART_RX_PIN));
     uart_init(SYNSCAN_UART_ID, SYNSCAN_BAUD_RATE);
+
+    critical_section_init(&g_gps_critical_section);
+    multicore_launch_core1(gps_core1_entry);
 
     // LED initialization
     status_led_init();
@@ -316,13 +383,6 @@ int main()
 
     while (true)
     {
-        // GPS UART processing
-        while (uart_is_readable(GPS_UART_ID))
-        {
-            char c = uart_getc(GPS_UART_ID);
-            gps_parse(c);
-        }
-
         // SynScan UART processing
         while (uart_is_readable(SYNSCAN_UART_ID))
         {
@@ -340,35 +400,66 @@ int main()
             }
         }
 
+        critical_section_enter_blocking(&g_gps_critical_section);
+        bool new_gga_pvt_msg = g_new_synscan_gga_pvt_msg;
+        if (new_gga_pvt_msg)
+        {
+            memcpy(synscan_gga_pvt_buff, g_synscan_gga_pvt_msg, sizeof(synscan_gga_pvt_buff));
+            g_new_synscan_gga_pvt_msg = false;
+        }
+        critical_section_exit(&g_gps_critical_section);
+
+        if (new_gga_pvt_msg && g_send_synscan_gga_pvt_msg)
+        {
+            synscan_gga_pvt_buff_length = strlen(synscan_gga_pvt_buff);
+            synscan_gga_pvt_buff_index = 0;
+        }
+
+        if (synscan_pvt_buff_index >= SYNSCAN_PVT_MSG_SIZE &&
+            synscan_gga_pvt_buff_index < synscan_gga_pvt_buff_length)
+        {
+            for (uint16_t i = 0; (i < 4) && (synscan_gga_pvt_buff_index < synscan_gga_pvt_buff_length); i++)
+            {
+                uart_putc_raw(SYNSCAN_UART_ID, synscan_gga_pvt_buff[synscan_gga_pvt_buff_index++]);
+            }
+        }
+
         // check if we have a new NMEA sentence
-        if (g_new_nmea)
+        critical_section_enter_blocking(&g_gps_critical_section);
+        bool new_nmea = g_new_gps_nmea;
+        if (new_nmea)
+        {
+            synscan_pvt_msg = g_synscan_binary_pvt_msg;
+            g_new_gps_nmea = false;
+        }
+        critical_section_exit(&g_gps_critical_section);
+
+        if (new_nmea)
         {
             // Update the status LED color
-            if (g_synscan_pvt_msg.quality_of_fix == 0) // No fix
+            if (synscan_pvt_msg.quality_of_fix == 0) // No fix
             {
                 colored_status_led_change_color(RED_LED);
             }
-            else if (g_synscan_pvt_msg.quality_of_fix == 1) // 2D fix
+            else if (synscan_pvt_msg.quality_of_fix == 1) // 2D fix
             {
                 colored_status_led_change_color(YELLOW_LED);
             }
-            else if (g_synscan_pvt_msg.quality_of_fix == 2) // 3D fix
+            else if (synscan_pvt_msg.quality_of_fix == 2) // 3D fix
             {
                 colored_status_led_change_color(GREEN_LED);
             }
 
             // Check if we need to send the SynScan PVT message
-            if (g_send_synscan_pvt_msg)
+            if (g_send_synscan_binary_pvt_msg)
             {
                 // Build the PVT message
-                synscan_build_pvt_msg(&g_synscan_pvt_msg, synscan_pvt_buff);
+                synscan_build_pvt_msg(&synscan_pvt_msg, synscan_pvt_buff);
 
                 // Reset the index to start sending the message
                 synscan_pvt_buff_index = 0;
             }
 
-            // Reset the new NMEA flag
-            g_new_nmea = false;
         }
     }
 
