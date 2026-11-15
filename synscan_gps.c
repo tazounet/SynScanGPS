@@ -27,7 +27,7 @@
 #define GREEN_LED PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0, 0x0f, 0)
 
 // Constants
-#define GPS_BUFF_SIZE MINMEA_MAX_SENTENCE_LENGTH
+#define GPS_BUFF_SIZE (MINMEA_MAX_SENTENCE_LENGTH + 3)
 #define SYNSCAN_BUFF_SIZE 32
 
 // SynScan binary message
@@ -78,7 +78,8 @@ uint8_t g_synscan_index = 0;
 
 // GPS nmea buffer
 char g_nmea_buffer[GPS_BUFF_SIZE] = {0};
-uint8_t g_nmea_index = 0;
+uint16_t g_nmea_index = 0;
+bool g_nmea_overflow = false;
 
 // Output buffers
 synscan_pvt_msg_t g_synscan_binary_pvt_msg = {0};
@@ -114,6 +115,10 @@ static char compute_checksum(char *buf, uint16_t len)
 
 static void synscan_parse(char c)
 {
+    static const uint8_t no_output_cmd[] = {'%', '%', 0xf1, 0x13, 0x00, 0xe2, '\r', '\n'};
+    static const uint8_t binary_output_cmd[] = {'%', '%', 0xf1, 0x13, 0x03, 0xe1, '\r', '\n'};
+    static const uint8_t gga_output_cmd[] = {'%', '%', 0xf1, 0x13, 0x01, 0xe3, '\r', '\n'};
+
     // Valid commands start with '%%'
     if (g_synscan_index == 0 && c != '%')
     {
@@ -134,7 +139,8 @@ static void synscan_parse(char c)
     if (c == '\n')
     {
         // End of command
-        if (strncmp(g_synscan_buffer, "%%\xf1\x13\x00\xe2\r\n", g_synscan_index) == 0)
+        if (g_synscan_index == sizeof(no_output_cmd) &&
+            memcmp(g_synscan_buffer, no_output_cmd, sizeof(no_output_cmd)) == 0)
         {
             // No output
             g_send_synscan_binary_pvt_msg = false;
@@ -145,7 +151,8 @@ static void synscan_parse(char c)
             // Send ack
             sendAck();
         }
-        else if (strncmp(g_synscan_buffer, "%%\xf1\x13\x03\xe1\r\n", g_synscan_index) == 0)
+        else if (g_synscan_index == sizeof(binary_output_cmd) &&
+                 memcmp(g_synscan_buffer, binary_output_cmd, sizeof(binary_output_cmd)) == 0)
         {
             // Binary PVT output
             g_send_synscan_binary_pvt_msg = true;
@@ -156,7 +163,8 @@ static void synscan_parse(char c)
             // Send ack
             sendAck();
         }
-        else if (strncmp(g_synscan_buffer, "%%\xf1\x13\x01\xe3\r\n", g_synscan_index) == 0)
+        else if (g_synscan_index == sizeof(gga_output_cmd) &&
+                 memcmp(g_synscan_buffer, gga_output_cmd, sizeof(gga_output_cmd)) == 0)
         {
             // GGA PVT output
             g_send_synscan_binary_pvt_msg = false;
@@ -214,12 +222,25 @@ static void sendAck()
 
 static void gps_parse(char c)
 {
-    // copy character to nmea buffer
-    g_nmea_buffer[g_nmea_index++] = c;
-
-    // if we reach the end of the sentence or buffer is full
-    if (c == '\n' || g_nmea_index >= sizeof(g_nmea_buffer) - 2)
+    if (c != '\n')
     {
+        if (!g_nmea_overflow)
+        {
+            if (g_nmea_index < sizeof(g_nmea_buffer) - 2)
+            {
+                g_nmea_buffer[g_nmea_index++] = c;
+            }
+            else
+            {
+                g_nmea_overflow = true;
+            }
+        }
+        return;
+    }
+
+    if (!g_nmea_overflow && g_nmea_index < sizeof(g_nmea_buffer) - 1)
+    {
+        g_nmea_buffer[g_nmea_index++] = c;
         g_nmea_buffer[g_nmea_index] = '\0';
 
         // call minmea parser
@@ -334,9 +355,10 @@ static void gps_parse(char c)
         default: // ignore other sentences
             break;
         }
-
-        g_nmea_index = 0;
     }
+
+    g_nmea_index = 0;
+    g_nmea_overflow = false;
 }
 
 static void gps_core1_entry(void)
