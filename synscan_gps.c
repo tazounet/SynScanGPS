@@ -2,6 +2,7 @@
 // Copyright (C) 2014-2025 tazounet
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -62,6 +63,7 @@ static void synscan_build_pvt_msg(synscan_pvt_msg_t *pvt, char *msg);
 static void sendAck();
 static uint8_t uint2bcd(int val);
 static char compute_checksum(char *buf, uint16_t len);
+static bool minmea_coord_to_semicircles(const struct minmea_float *coord, int max_degrees, int32_t *result);
 static void gps_parse(char c);
 static void gps_core1_entry(void);
 
@@ -111,6 +113,46 @@ static char compute_checksum(char *buf, uint16_t len)
     }
 
     return chksum;
+}
+
+static bool minmea_coord_to_semicircles(const struct minmea_float *coord, int max_degrees, int32_t *result)
+{
+    int64_t scale = coord->scale;
+    int64_t signed_raw = coord->value;
+
+    if (scale <= 0)
+    {
+        return false;
+    }
+
+    int64_t raw = signed_raw < 0 ? -signed_raw : signed_raw;
+    int64_t degree_scale = scale * 100;
+    int64_t degrees = raw / degree_scale;
+    int64_t minute_fraction = raw % degree_scale;
+
+    if (degrees > max_degrees ||
+        minute_fraction >= scale * 60 ||
+        (degrees == max_degrees && minute_fraction != 0))
+    {
+        return false;
+    }
+
+    // Convert degrees/minutes to arcminutes, then map 10800 arcminutes to 2^31 semicircles.
+    int64_t arc_minutes_scaled = degrees * 60 * scale + minute_fraction;
+    int64_t numerator = arc_minutes_scaled * (INT64_C(1) << 31);
+    int64_t denominator = scale * 10800;
+    int64_t magnitude = (numerator + denominator / 2) / denominator;
+
+    if (signed_raw < 0)
+    {
+        *result = magnitude == (INT64_C(1) << 31) ? INT32_MIN : -(int32_t)magnitude;
+    }
+    else
+    {
+        *result = magnitude > INT32_MAX ? INT32_MAX : (int32_t)magnitude;
+    }
+
+    return true;
 }
 
 static void synscan_parse(char c)
@@ -266,10 +308,18 @@ static void gps_parse(char c)
                 memcpy(&date, date_bytes, sizeof(date));
                 memcpy(&time, time_bytes, sizeof(time));
 
-                float latitude = (minmea_tocoord(&frame.latitude) / 360.0) * 4294967296.0;
-                float longitude = (minmea_tocoord(&frame.longitude) / 360.0) * 4294967296.0;
-                int32_t latitude_value = (int32_t)latitude;
-                int32_t longitude_value = (int32_t)longitude;
+                int32_t latitude_value = 0;
+                int32_t longitude_value = 0;
+                if (!minmea_coord_to_semicircles(&frame.latitude, 90, &latitude_value) ||
+                    !minmea_coord_to_semicircles(&frame.longitude, 180, &longitude_value))
+                {
+                    if (&frame.valid)
+                    {
+                        // if the frame is valid, long/lat shall be in the correct range
+                        printf("RMC sentence contains an invalid coordinate\n");
+                    }
+                }
+
                 uint16_t heading = (uint16_t)minmea_tofloat(&frame.course);
                 uint16_t speed = (uint16_t)minmea_tofloat(&frame.speed);
 
